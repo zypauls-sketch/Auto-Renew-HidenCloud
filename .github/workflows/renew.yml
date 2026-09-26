@@ -3,8 +3,8 @@ name: Auto Renew HidenCloud
 on:
   workflow_dispatch:
   schedule:
-    # 每周六北京时间 10:41 运行 (转换为 UTC 时间为 02:41)
-    - cron: '41 02 * * 6'
+    # 每周六北京时间 10:35 运行 (转换为 UTC 时间为 02:35)
+    - cron: '35 02 * * 6'
 
 permissions:
   actions: write
