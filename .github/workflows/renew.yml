@@ -3,7 +3,8 @@ name: Auto Renew HidenCloud
 on:
   workflow_dispatch:
   schedule:
-    - cron: '13 02 * * 6' # 根据到期时间在星期几 提前一天,比如星期三到期，cron写星期二即可
+    # 每周六北京时间 10:41 运行 (转换为 UTC 时间为 02:41)
+    - cron: '41 02 * * 6'
 
 permissions:
   actions: write
@@ -16,10 +17,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: ⚙ 设置 Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
@@ -47,6 +48,14 @@ jobs:
           PROXY_SERVER: ${{ env.PROXY_SERVER }}
         run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 app.py
 
+      - name: 📸 上传调试/报错截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: "*.png"
+          if-no-files-found: ignore
+
       - name: 🧽 清理进程和临时文件
         if: always()
         run: |
@@ -56,7 +65,7 @@ jobs:
           pkill -f Xvfb || true
           rm -f sing-box sing-box-config.json sing-box.log
 
-      - name: 🧹 清理旧的工作流运行记录
+      - name: 🧹 清理旧的工作流运行记录（保留最近 3 次）
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
@@ -65,8 +74,8 @@ jobs:
           count=0
           for run_id in $runs; do
             count=$((count + 1))
-            if [ $count -gt 1 ]; then
-              echo "删除运行记录: $run_id"
+            if [ $count -gt 3 ]; then
+              echo "删除过期运行记录: $run_id"
               gh run delete $run_id || true
             fi
           done
