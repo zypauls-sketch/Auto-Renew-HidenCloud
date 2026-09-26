@@ -26,6 +26,7 @@ def log(message):
 STEALTH_JS = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 window.chrome = { runtime: {} };
+window.canRunAds = true;
 """
 
 def get_current_ip(proxy_server=None):
@@ -46,7 +47,6 @@ def send_telegram_notification(status, old_due, new_due):
         log("⚠️ Telegram 未配置，跳过通知")
         return False
     
-    # 获取运行时间（转换为 UTC+8）
     local_time = time.gmtime(time.time() + 8 * 3600)
     now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
     if '@' in EMAIL:
@@ -83,6 +83,38 @@ def send_telegram_notification(status, old_due, new_due):
     except Exception as e:
         log(f"❌ Telegram 通知异常: {e}")
         return False
+
+def dismiss_adblock_overlay(page):
+    """检测并强行销毁页面上的 'Ad blocker detected' 遮罩层"""
+    try:
+        removed = page.evaluate("""() => {
+            let removedCount = 0;
+            const allElements = Array.from(document.querySelectorAll('*'));
+            for (const el of allElements) {
+                if (el.children.length === 0 && el.innerText && el.innerText.includes('Ad blocker detected')) {
+                    let parent = el;
+                    while (parent && parent !== document.body) {
+                        const style = window.getComputedStyle(parent);
+                        if (style.position === 'fixed' || style.position === 'absolute' || parent.getAttribute('role') === 'dialog') {
+                            parent.remove();
+                            removedCount++;
+                            break;
+                        }
+                        parent = parent.parentElement;
+                    }
+                }
+            }
+            // 恢复页面滚动
+            document.body.style.overflow = 'auto';
+            if (document.documentElement) document.documentElement.style.overflow = 'auto';
+            return removedCount > 0;
+        }""")
+        if removed:
+            log("🛡️ 成功清除 'Ad blocker detected' 弹窗遮罩！")
+            return True
+    except Exception as e:
+        pass
+    return False
 
 def handle_cloudflare(page):
     """处理 Cloudflare Turnstile / Managed Challenge 验证"""
@@ -178,14 +210,12 @@ def get_server_id(page):
         html = page.content()
         log(f"📝 页面长度: {len(html)}, URL: {page.url}")
 
-        # 方案1: 从 href 链接中提取 /service/数字/manage
         matches = re.findall(r'/service/(\d+)/manage', html)
         if matches:
             server_id = matches[0]
             log(f"✅ 从链接中获取到 Server ID: {server_id}")
             return server_id
 
-        # 方案2: 从文本中提取 Free Server #数字
         matches = re.findall(r'#(\d{4,})', html)
         if matches:
             server_id = matches[0]
@@ -229,8 +259,8 @@ def renew_service(page):
         if page.url != SERVICE_URL:
             page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
+        dismiss_adblock_overlay(page)
 
-        # 1. 检查页面上是否已有未到期提示
         body_text = page.locator("body").inner_text()
         if "renewal restricted" in body_text.lower() or "can only renew" in body_text.lower():
             log("⚠️ 未到续期时间，当前无法续期。")
@@ -246,50 +276,49 @@ def renew_service(page):
             page.screenshot(path="renew_btn_not_found.png")
             return False
 
-        # 2. 点击 Renew 按钮唤起弹窗
         log("🖱️ 点击 'Renew' 按钮...")
         renew_btn.scroll_into_view_if_needed()
         try:
             renew_btn.click(timeout=5000)
         except Exception:
-            log("⚠️ 常规点击被阻挡，尝试强制点击...")
             renew_btn.click(force=True)
 
+        # 核心：循环检查、清理 Adblock 遮罩，等待弹窗加载
         time.sleep(2)
-        # 弹窗打开后可能立即出现 Cloudflare 验证或遮罩层，必须在此处处理
+        dismiss_adblock_overlay(page)
         handle_cloudflare(page)
 
-        # 3. 再次检查是否弹出“未到续期时间”的 Toast / 提示
-        time.sleep(1)
-        curr_text = page.locator("body").inner_text()
-        if "renewal restricted" in curr_text.lower() or "can only renew" in curr_text.lower():
-            log("⚠️ 收到提示：未到续期时间，无法续期。")
-            page.screenshot(path="renew_not_allowed.png")
-            return "NOT_TIME"
-
-        # 4. 查找并等待弹窗内部的确认/创建发票按钮（支持多种可能的选择器）
+        # 候选确认按钮选择器
         candidate_selectors = [
             'button:has-text("Create Invoice")',
             'button:has-text("Create invoice")',
             'input[value*="Invoice" i]',
             'div[id*="renewService"] button[type="submit"]',
             'div[role="dialog"] button[type="submit"]',
-            'button:has-text("Renew"):visible',
+            'div[id*="renewService"] button',
             'a:has-text("Create Invoice")',
         ]
 
         target_btn = None
         log("🖲️ 等待续费确认按钮出现...")
         start_find = time.time()
-        while time.time() - start_find < 15:
+        while time.time() - start_find < 20:
+            dismiss_adblock_overlay(page)
             handle_cloudflare(page)
+
+            # 再次检查未到期提示
+            curr_text = page.locator("body").inner_text()
+            if "renewal restricted" in curr_text.lower() or "can only renew" in curr_text.lower():
+                log("⚠️ 收到提示：未到续期时间，无法续期。")
+                page.screenshot(path="renew_not_allowed.png")
+                return "NOT_TIME"
+
             for sel in candidate_selectors:
                 loc = page.locator(sel)
-                # 排除最开始主界面的 Renew 触发按钮
                 for idx in range(loc.count()):
                     btn = loc.nth(idx)
                     if btn.is_visible():
-                        # 避开外部的 data-modal-toggle 按钮
+                        # 排除外层触发按钮
                         if not btn.get_attribute("data-modal-toggle"):
                             target_btn = btn
                             log(f"✅ 找到确认按钮: {sel}")
@@ -305,17 +334,17 @@ def renew_service(page):
             page.screenshot(path="renew_modal_failed.png")
             return False
 
-        # 5. 点击确认/生成发票按钮
         log("🖱️ 点击确认按钮创建发票...")
         try:
             target_btn.click(timeout=5000)
         except Exception:
             target_btn.click(force=True)
 
-        # 6. 等待发票页面跳转
+        # 等待发票页面跳转
         new_invoice_url = None
         start_wait = time.time()
         while time.time() - start_wait < 90:
+            dismiss_adblock_overlay(page)
             if "/payment/invoice/" in page.url or "/invoice/" in page.url:
                 new_invoice_url = page.url
                 log(f"🎉 页面已跳转至发票页: {new_invoice_url}")
@@ -331,8 +360,9 @@ def renew_service(page):
         if page.url != new_invoice_url:
             page.goto(new_invoice_url, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
+        dismiss_adblock_overlay(page)
 
-        # 7. 查找并点击 'Pay' 按钮
+        # 点击支付按钮
         log("🔎 查找 'Pay' 按钮...")
         pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible, input[value*="Pay" i]:visible').first
         pay_btn.wait_for(state="visible", timeout=30000)
@@ -343,7 +373,6 @@ def renew_service(page):
             pay_btn.click(force=True)
         log("✅ 'Pay' 按钮已点击。")
 
-        # 8. 等待支付确认完成，返回服务页确认新到期时间
         time.sleep(6)
         page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
@@ -355,7 +384,6 @@ def renew_service(page):
         return False
 
 def main():
-    # 检查必要环境变量
     if not COOKIE_VALUE and not (EMAIL and PASSWORD):
         log("❌ 缺少登录凭证，请至少配置 COOKIE_VALUE 或 EMAIL+PASSWORD")
         sys.exit(1)
@@ -370,7 +398,6 @@ def main():
             else:
                 log("🌐 直连模式（未使用代理）")
             
-            # 获取当前出口 IP
             current_ip = get_current_ip(PROXY_SERVER)
             log(f"🎯 当前出口IP: {current_ip}")
 
@@ -393,21 +420,28 @@ def main():
             page = context.new_page()
             page.add_init_script(STEALTH_JS)
 
+            # 网络层拦截：对常见广告域名伪造 200 响应，防止防广告脚本报错
+            def mock_ad_response(route):
+                route.fulfill(status=200, content_type="application/javascript", body="window.canRunAds = true;")
+            
+            page.route("**/*ads*", mock_ad_response)
+            page.route("**/*doubleclick*", mock_ad_response)
+            page.route("**/*googlesyndication*", mock_ad_response)
+            page.route("**/*monetag*", mock_ad_response)
+            page.route("**/*adsterra*", mock_ad_response)
+
             if not login(page):
                 sys.exit(1)
 
-            # 登录成功后，自动获取 Server ID
             server_id = get_server_id(page)
             if not server_id:
                 log("❌ 无法获取 Server ID，退出。")
                 sys.exit(1)
             SERVICE_URL = f"{BASE_URL}/service/{server_id}/manage"
 
-            # 获取旧到期时间
             old_due = get_due_date(page)
             log(f"📆 续费前到期时间：{old_due}")
 
-            # 执行续费
             renew_result = renew_service(page)
 
             new_due = old_due
@@ -417,12 +451,11 @@ def main():
             elif renew_result is False:
                 log("❌ 续费失败，脚本退出。")
                 status = "❌ 续期失败"
-            else:  # renew_result is True
+            else:
                 new_due = get_due_date(page)
                 log(f"📆 续费后到期时间：{new_due}")
                 status = "✅ 续期成功"
 
-            # 发送 Telegram 通知
             send_telegram_notification(status, old_due, new_due)
 
             if renew_result == "NOT_TIME":
